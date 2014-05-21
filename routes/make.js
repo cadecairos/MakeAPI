@@ -123,27 +123,40 @@ module.exports = function( makeModel ) {
     }, authenticated );
   }
 
-  function makeSearch( dsl, requestQuery, callback ) {
+  function buildAdvancedQuery( advancedQuery, authenticated, callback ) {
+    queryBuilder.search( advancedQuery, function( err, dsl ) {
+      if ( err ) {
+        if ( err.code === 404 ) {
+          // A non-existant user means we can assume the search will return 0 makes
+          return callback( err );
+        }
+        return callback( new Error( "Failed to build the Query") );
+      }
+      callback( null, dsl, advancedQuery );
+    }, authenticated );
+  }
+
+  function makeSearch( dsl, query, callback ) {
     Make.search( dsl, function( err, results ) {
       if ( err ) {
         return callback( new Error( "The query produced invalid ElasticSearch DSL" ) );
       }
-      callback( null, results.hits.hits, requestQuery, results.hits.total );
+      callback( null, results.hits.hits, query, results.hits.total );
     });
   }
 
-  function transformMakes( searchResults, requestQuery, total, callback ) {
+  function transformMakes( searchResults, query, total, callback ) {
     mapUsernames(searchResults, function( err, mappedMakes ) {
       if ( err ) {
         return callback( err );
       }
-      callback( null, mappedMakes, requestQuery, total );
+      callback( null, mappedMakes, query, total );
     });
   }
 
-  function getRemixCounts( searchResults, requestQuery, total, callback ) {
+  function getRemixCounts( searchResults, query, total, callback ) {
     var now;
-    if ( requestQuery.getRemixCounts === "true" ) {
+    if ( query.getRemixCounts === "true" ) {
       now = Date.now();
       async.mapSeries( searchResults, function iterator( make, mapCallback ) {
         queryBuilder.remixCount( make._id, 0, now, function( err, dsl ) {
@@ -169,6 +182,25 @@ module.exports = function( makeModel ) {
     }
   }
 
+  function executeSearch( dsl, req, res ) {
+    // Instruct mongoostastic to run the DSL against the Elastic Search endpoint
+    Make.search( dsl, function( err, results ) {
+      var searchResults;
+      if ( err ) {
+        error( res, "The query produced invalid ElasticSearch DSL. Query URL: " + req.url, "search", 500 );
+      } else {
+        searchResults = results.hits;
+        mapUsernames( searchResults.hits, function( err, mappedMakes ) {
+          if ( err ) {
+            return error( res, err, "search", 500 );
+          }
+          metrics.increment( "make.search.success" );
+          res.json( { makes: mappedMakes, total: searchResults.total } );
+        });
+      }
+    });
+  }
+
   function doSearch( req, res, authenticated ) {
     async.waterfall([
       function( callback ) {
@@ -187,6 +219,28 @@ module.exports = function( makeModel ) {
         return error( res, err.toString(), "search", 500 );
       }
       metrics.increment( "make.search.success" );
+      res.json( { makes: makes, total: total } );
+    });
+  }
+
+  function doAdvancedSearch( req, res, authenticated ) {
+    async.waterfall([
+      function( callback ) {
+        callback( null, req.body, authenticated );
+      },
+      buildAdvancedQuery,
+      makeSearch,
+      transformMakes,
+      getRemixCounts
+    ], function( err, makes, total ) {
+      if( err ) {
+        if ( err.code === 404 ) {
+          metrics.increment( "make.advancedSearch.success" );
+          return res.json( { makes: [], total: 0 } );
+        }
+        return error( res, err.toString(), "advancedSearch", 500 );
+      }
+      metrics.increment( "make.advancedSearch.success" );
       res.json( { makes: makes, total: total } );
     });
   }
@@ -217,6 +271,12 @@ module.exports = function( makeModel ) {
       }
       doSearch( req, res, false );
     },
+    advancedSearch: function( req, res ) {
+      if ( !req.body ) {
+        return error( res, "Missing Request Body", "advancedSearch", 400 );
+      }
+      doAdvancedSearch( req, res, false );
+    },
     protectedSearch: function( req, res ) {
       if ( !req.query ) {
         return error( res, "Malformed Request", "search", 400 );
@@ -229,15 +289,13 @@ module.exports = function( makeModel ) {
       }
       var id = req.query.id,
           from = req.query.from || 0,
-          to = req.query.to || Date.now();
+          to = req.query.to || Date.now(),
+          dsl;
 
-      queryBuilder.remixCount( id, from, to, function( err, dsl ) {
-        if ( err ) {
-          return error( res, err, "remixCount", err.code );
-        }
-        Make.search( dsl, function( err, results ) {
-          return res.json({ count: results.hits.total });
-        });
+      dsl = queryBuilder.remixCount( id, from, to );
+
+      Make.search( dsl, function( err, results ) {
+        return res.json({ count: results.hits.total });
       });
     },
     autocomplete: function( req, res ) {

@@ -212,6 +212,13 @@ app.get(
   routes.search
 );
 
+app.post(
+  "/api/20130724/make/search",
+  Mongo.isDbOnline,
+  middleware.crossOrigin,
+  routes.advancedSearch
+);
+
 // Authenticated Make Search
 app.get(
   "/api/20130724/make/protectedSearch",
